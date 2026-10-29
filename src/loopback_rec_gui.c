@@ -29,8 +29,11 @@
  *   [--silence-change-at S:on,db,min,pad]  (up to 8: change the silence cut live at S s)
  *   [--rename-at S:Name]  (up to 4: type a new name at S s; the files are renamed live)
  *   [--source-exe NAME]   (record only one app, e.g. chrome.exe, via process loopback)
+ *   [--source-switch-at S:EXE|S:system]  (up to 4: change the source live at S s, 1.4.1)
  *   --list-sources --out <folder>  (log the apps the source picker would offer, then exit)
  *
+ * Source switch (1.4.1): the picker also works while recording/paused/pending; the capture
+ * thread swaps the capture client live into the same file (gap = synthesized silence).
  * Source (1.4): "Tutto il sistema" = WASAPI loopback of the default output device, or one
  * app = Windows 10 2004+/11 process loopback (VAD\Process_Loopback, include process tree)
  * on the app's root process, so every child process (e.g. the browser's audio service) is
@@ -1171,6 +1174,21 @@ static volatile LONG g_srcNotice;    /* UI: show "process loopback unavailable" 
 static volatile LONG g_srcAttaches, g_srcActFails, g_srcExits;
 static volatile LONG g_srcPid;
 static HRESULT g_srcLastHr;
+/* 1.4.1: live source switch. The UI (or the test) posts a request; the capture thread applies it */
+static WCHAR g_reqSrcExe[64], g_reqSrcName[128];   /* protected by g_statusLock */
+static volatile LONG g_srcSwitchReq;  /* 1 = a request is waiting */
+static volatile LONG g_srcSwitches;   /* switches applied in this run */
+static HANDLE g_srcSwitchEvent;       /* manual reset: wakes the capture thread */
+static int src_switch_apply(void);    /* capture thread (defined after the session helpers) */
+static void src_switch_request(const WCHAR *exe, const WCHAR *name)
+{
+    EnterCriticalSection(&g_statusLock);
+    wcsncpy(g_reqSrcExe, exe ? exe : L"", 63); g_reqSrcExe[63] = 0;
+    wcsncpy(g_reqSrcName, (exe && exe[0] && name) ? name : L"", 127); g_reqSrcName[127] = 0;
+    LeaveCriticalSection(&g_statusLock);
+    InterlockedExchange(&g_srcSwitchReq, 1);
+    if (g_srcSwitchEvent) SetEvent(g_srcSwitchEvent);
+}
 
 typedef struct { DWORD pid, ppid; WCHAR exe[64]; } PInfo;
 
@@ -1658,6 +1676,7 @@ static unsigned __stdcall capture_thread(void *arg)
     int first = 1;
     IMMDeviceEnumerator *notifEn = NULL;
     int notifRegistered = 0;
+    int noReconnect = 0;                  /* next open follows a source switch: not a reconnect */
     (void)arg;
 
     memset(&conv, 0, sizeof(conv));
@@ -1682,9 +1701,15 @@ static unsigned __stdcall capture_thread(void *arg)
     while (WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) {
         Dev d;
         LONG64 lastPacket, lastCheck;
-        HANDLE waits[2];
+        HANDLE waits[3];
 
         ResetEvent(g_devChangedEvent);
+        ResetEvent(g_srcSwitchEvent);
+        if (src_switch_apply()) {
+            noReconnect = 1;
+            backoff = BACKOFF_MIN_MS;
+            if (!pause_active()) pad_to_now(&conv);    /* the gap of the switch becomes silence */
+        }
         if (g_curSrcExe[0] && g_srcState != 3) {
             /* one app: find its root process, wait (recording silence) while it is not running */
             DWORD pid = src_find_root(g_curSrcExe);
@@ -1702,6 +1727,7 @@ static unsigned __stdcall capture_thread(void *arg)
                 while (now_ms() < until) {
                     if (!pause_active()) pad_to_now(&conv);
                     if (WaitForSingleObject(g_stopEvent, 100) == WAIT_OBJECT_0) break;
+                    if (WaitForSingleObject(g_srcSwitchEvent, 0) == WAIT_OBJECT_0) break;
                 }
                 continue;
             }
@@ -1740,23 +1766,30 @@ static unsigned __stdcall capture_thread(void *arg)
                 if (!pause_active()) pad_to_now(&conv);
                 if (WaitForSingleObject(g_stopEvent, 100) == WAIT_OBJECT_0) break;
                 if (WaitForSingleObject(g_devChangedEvent, 0) == WAIT_OBJECT_0) break;
+                if (WaitForSingleObject(g_srcSwitchEvent, 0) == WAIT_OBJECT_0) break;
             }
             backoff = backoff * 2 > BACKOFF_MAX_MS ? BACKOFF_MAX_MS : backoff * 2;
             continue;
         }
         backoff = BACKOFF_MIN_MS;
         InterlockedExchange(&g_haveDevice, 1);
-        if (!first) InterlockedIncrement(&g_reconnects);
-        first = 0;
+        if (!first && !noReconnect) InterlockedIncrement(&g_reconnects);
+        first = 0; noReconnect = 0;
         lastPacket = lastCheck = now_ms();
-        waits[0] = g_stopEvent; waits[1] = g_devChangedEvent;
+        waits[0] = g_stopEvent; waits[1] = g_srcSwitchEvent; waits[2] = g_devChangedEvent;
 
         for (;;) {
-            DWORD w = WaitForMultipleObjects(d.proc ? 1 : 2, waits, FALSE, POLL_MS);   /* app capture follows the default device by itself */
+            DWORD w = WaitForMultipleObjects(d.proc ? 2 : 3, waits, FALSE, POLL_MS);   /* app capture follows the default device by itself */
             int got = 0;
             LONG64 t;
             if (w == WAIT_OBJECT_0) break;
-            if (w == WAIT_OBJECT_0 + 1) { log_msg(L"Default output device changed, switching"); break; }
+            if (w == WAIT_OBJECT_0 + 1) {         /* live source switch */
+                drain(&d, &conv, &got);           /* keep what the old source already delivered */
+                ResetEvent(g_srcSwitchEvent);
+                if (src_switch_apply()) { noReconnect = 1; break; }
+                continue;                         /* same source: nothing to do */
+            }
+            if (w == WAIT_OBJECT_0 + 2) { log_msg(L"Default output device changed, switching"); break; }
             hr = keepalive(&d);
             if (FAILED(hr)) { LOG_HR(L"Keep-alive render", hr); break; }
             hr = drain(&d, &conv, &got);
@@ -2441,6 +2474,32 @@ static LONG64 sess_get_int(const WCHAR *key, LONG64 def)
     WCHAR b[32];
     GetPrivateProfileStringW(L"Session", key, L"", b, 32, g_sessIni);
     return b[0] ? _wtoi64(b) : def;
+}
+/* capture thread: take a pending source-switch request. Returns 1 if the source changed. */
+static int src_switch_apply(void)
+{
+    WCHAR e[64], n[128], oldN[128];
+    if (!InterlockedExchange(&g_srcSwitchReq, 0)) return 0;
+    EnterCriticalSection(&g_statusLock);
+    wcscpy(e, g_reqSrcExe); wcscpy(n, g_reqSrcName);
+    LeaveCriticalSection(&g_statusLock);
+    if (e[0] && !n[0]) wcsncpy(n, e, 127);
+    if (!_wcsicmp(e, g_curSrcExe)) { log_msg(L"Source switch to %ls ignored: already the source", e[0] ? n : L"whole system"); return 0; }
+    wcscpy(oldN, g_curSrcExe[0] ? (g_srcState == 3 ? L"whole system (fallback)" : g_curSrcName) : L"whole system");
+    EnterCriticalSection(&g_statusLock);
+    wcscpy(g_curSrcExe, e); wcscpy(g_curSrcName, e[0] ? n : L"");
+    LeaveCriticalSection(&g_statusLock);
+    InterlockedExchange(&g_srcState, 0); InterlockedExchange(&g_srcEverOk, 0);
+    InterlockedExchange(&g_srcPid, 0); g_srcActFails = 0; g_srcLastHr = S_OK;
+    InterlockedIncrement(&g_srcSwitches);
+    if (g_curLive) {                                 /* a crash now resumes with the new source */
+        sess_put(L"SourceExe", e[0] ? e : NULL);
+        sess_put(L"SourceName", e[0] ? n : NULL);
+    }
+    log_msg(L"SOURCE SWITCH #%ld at %.2f s of timeline (%.2f s in file): %ls -> %ls%ls%ls%ls", (long)g_srcSwitches,
+            (double)g_framesOut / OUT_RATE, (double)atomic_read64(&g_fileFrames) / OUT_RATE, oldN,
+            e[0] ? n : L"whole system", e[0] ? L" (" : L"", e, e[0] ? L")" : L"");
+    return 1;
 }
 static void sess_clear(void)
 {
@@ -3277,6 +3336,7 @@ static int rec_start(const WCHAR *folder, int splitMin, int resume, WCHAR *err, 
     g_reconnects = g_discont = g_haveDevice = g_writeError = 0;
     g_stopReason = 0; g_peakNow = g_peakMax = 0; g_rmsNow = 0;
     g_srcState = 0; g_srcEverOk = 0; g_srcNotice = 0; g_srcAttaches = g_srcActFails = g_srcExits = 0; g_srcPid = 0; g_srcLastHr = S_OK;
+    g_srcSwitchReq = 0; g_srcSwitches = 0; ResetEvent(g_srcSwitchEvent);
     ResetEvent(g_stopEvent); ResetEvent(g_doneEvent); ResetEvent(g_devChangedEvent);
     EnterCriticalSection(&g_statusLock);
     wcscpy(g_devName, L"(none)"); g_fmtDesc[0] = 0; g_curPath[0] = 0;
@@ -4588,6 +4648,31 @@ static SrcApp g_srcApps[SRC_MAX];
 static int    g_srcAppN;
 static WCHAR  g_srcBtnText[200];
 static LONG   g_srcBtnState = -1;
+static WCHAR  g_srcMsg[220];          /* non-blocking line after a live source switch (UI thread only) */
+static LONG64 g_srcMsgUntil;
+static int    g_srcMsgWarn;
+static void src_msg(int warn, LONG64 ms, const WCHAR *fmt, const WCHAR *a)
+{
+    _snwprintf(g_srcMsg, 219, fmt, a); g_srcMsg[219] = 0;
+    g_srcMsgWarn = warn; g_srcMsgUntil = now_ms() + ms;
+}
+/* the source in effect right now: the running session's (or its pending switch), the pending
+   session's, else the one chosen for the next recording */
+static void src_current(WCHAR *exe, WCHAR *name)
+{
+    exe[0] = name[0] = 0;
+    if (g_recording) {
+        EnterCriticalSection(&g_statusLock);
+        if (g_srcSwitchReq) { wcscpy(exe, g_reqSrcExe); wcscpy(name, g_reqSrcName); }
+        else { wcscpy(exe, g_curSrcExe); wcscpy(name, g_curSrcName); }
+        LeaveCriticalSection(&g_statusLock);
+    } else if (g_pending) {
+        GetPrivateProfileStringW(L"Session", L"SourceExe", L"", exe, 64, g_sessIni);
+        GetPrivateProfileStringW(L"Session", L"SourceName", L"", name, 128, g_sessIni);
+    } else { wcscpy(exe, g_srcExe); wcscpy(name, g_srcName); }
+    if (exe[0] && !name[0]) wcsncpy(name, exe, 127);
+    if (!exe[0]) name[0] = 0;
+}
 
 typedef HRESULT (WINAPI *PFN_DwmGetWindowAttribute)(HWND, DWORD, PVOID, DWORD);
 typedef struct { DWORD pids[256]; int n; PFN_DwmGetWindowAttribute dwm; } WinPids;
@@ -4654,10 +4739,12 @@ static void src_enum(void)
 static void src_label(WCHAR *out, size_t cch)
 {
     if (g_recording) {
+        EnterCriticalSection(&g_statusLock);
         if (!g_curSrcExe[0]) wcsncpy(out, L"Tutto il sistema", cch - 1);
         else if (g_srcState == 3) _snwprintf(out, cch - 1, L"Tutto il sistema (%ls non supportato)", g_curSrcName);
         else if (g_srcState == 2) _snwprintf(out, cch - 1, L"%ls (in attesa\u2026)", g_curSrcName);
         else wcsncpy(out, g_curSrcName, cch - 1);
+        LeaveCriticalSection(&g_statusLock);
     } else if (g_pending) {
         WCHAR e[64] = L"", nm[128] = L"";
         GetPrivateProfileStringW(L"Session", L"SourceExe", L"", e, 64, g_sessIni);
@@ -4695,12 +4782,13 @@ static void src_menu(HWND h)
         HMENU m = CreatePopupMenu(), sub = NULL;
         RECT br;
         int i, cmd, anyS = 0, anyW = 0, chosenListed = 0;
-        WCHAR it[200];
+        WCHAR it[200], curE[64], curN[128], newE[64], newN[128];
+        src_current(curE, curN);
         src_enum();
-        AppendMenuW(m, MF_STRING | (!g_srcExe[0] ? MF_CHECKED : 0), IDM_SRC_SYS, L"Tutto il sistema");
+        AppendMenuW(m, MF_STRING | (!curE[0] ? MF_CHECKED : 0), IDM_SRC_SYS, L"Tutto il sistema");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         for (i = 0; i < g_srcAppN; i++) {
-            int chosen = g_srcExe[0] && !_wcsicmp(g_srcExe, g_srcApps[i].exe);
+            int chosen = curE[0] && !_wcsicmp(curE, g_srcApps[i].exe);
             if (chosen) chosenListed = 1;
             if (g_srcApps[i].session) {
                 _snwprintf(it, 199, L"%ls%ls", g_srcApps[i].name, g_srcApps[i].active ? L"\t\u266A in riproduzione" : L"");
@@ -4714,8 +4802,8 @@ static void src_menu(HWND h)
             }
         }
         if (!anyS) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(nessuna app sta usando l'audio)");
-        if (g_srcExe[0] && !chosenListed) {
-            _snwprintf(it, 199, L"%ls (non in esecuzione)", g_srcName); it[199] = 0;
+        if (curE[0] && !chosenListed) {
+            _snwprintf(it, 199, L"%ls (non in esecuzione)", curN); it[199] = 0;
             AppendMenuW(m, MF_STRING | MF_CHECKED, IDM_SRC_KEEP, it);
         }
         if (anyW) AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"Altre app aperte");
@@ -4727,14 +4815,31 @@ static void src_menu(HWND h)
         cmd = (int)TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY, br.left, br.bottom, 0, h, NULL);
         DestroyMenu(m);
         if (cmd == IDM_SRC_REFRESH) continue;
-        if (g_recording || g_pending) return;          /* state changed while the menu was open */
-        if (cmd == IDM_SRC_SYS) { g_srcExe[0] = 0; g_srcName[0] = 0; }
+        if (g_stopping) return;                        /* state changed while the menu was open */
+        if (cmd == IDM_SRC_SYS) { newE[0] = 0; newN[0] = 0; }
         else if (cmd >= IDM_SRC0 && cmd < IDM_SRC0 + g_srcAppN) {
-            wcscpy(g_srcExe, g_srcApps[cmd - IDM_SRC0].exe);
-            wcscpy(g_srcName, g_srcApps[cmd - IDM_SRC0].name);
+            wcscpy(newE, g_srcApps[cmd - IDM_SRC0].exe);
+            wcscpy(newN, g_srcApps[cmd - IDM_SRC0].name);
         } else return;
+        {   /* compare with what is in effect now (the menu may have been open across a start/stop) */
+            WCHAR e2[64], n2[128];
+            src_current(e2, n2);
+            if (!_wcsicmp(newE, e2)) { if (!g_recording && !g_pending) { wcscpy(g_srcExe, newE); wcscpy(g_srcName, newN); } return; }
+        }
+        wcscpy(g_srcExe, newE); wcscpy(g_srcName, newN);   /* also the choice for the next recordings */
         settings_save(NULL);
-        log_msg(L"Source set to %ls", g_srcExe[0] ? g_srcName : L"whole system");
+        if (g_recording) {                     /* live: the capture thread switches, same file */
+            log_msg(L"Source change requested while recording: %ls%ls", newE[0] ? newN : L"whole system",
+                    g_pauseReq ? L" (paused)" : L"");
+            src_switch_request(newE, newN);
+            if (newE[0] && !src_find_root(newE))
+                src_msg(1, 8000, L"Sorgente cambiata: %ls non \u00E8 in esecuzione, registra silenzio finch\u00E9 non parte", newN);
+            else src_msg(0, 5000, L"Sorgente cambiata: %ls", newE[0] ? newN : L"Tutto il sistema");
+        } else if (g_pending) {                /* the resumed session will use it */
+            sess_put(L"SourceExe", newE[0] ? newE : NULL);
+            sess_put(L"SourceName", newE[0] ? newN : NULL);
+            log_msg(L"Source of the pending session set to %ls", newE[0] ? newN : L"whole system");
+        } else log_msg(L"Source set to %ls", g_srcExe[0] ? g_srcName : L"whole system");
         src_button_update();
         InvalidateRect(h, NULL, FALSE);
         return;
@@ -4756,7 +4861,7 @@ static void update_controls(void)
     EnableWindow(g_btnFolder, !rec && !pend);
     EnableWindow(g_cbTemplate, !pend && !g_stopping);
     EnableWindow(g_btnTpl, !pend && !g_stopping);
-    EnableWindow(g_btnSrc, !rec && !pend && !g_stopping && !g_exitWhenIdle);
+    EnableWindow(g_btnSrc, !g_stopping && !g_exitWhenIdle);   /* 1.4.1: also while recording / paused / pending */
     src_button_update();
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
@@ -5228,6 +5333,9 @@ static void paint(HDC dc, const RECT *cl)
     } else if (paused) {
         WCHAR pd[24], pt[24];
         fmt_dur(pd, 24, pauseNowMs); fmt_dur(pt, 24, paused_total_ms());
+        if (now_ms() < g_srcMsgUntil)
+            _snwprintf(b1, 511, L"%ls  \u00B7  In pausa da %ls  \u00B7  Pause totali %ls", g_srcMsg, pd, pt);
+        else
         _snwprintf(b1, 511, L"In pausa da %ls  \u00B7  Pause totali %ls  \u00B7  non registra (Ctrl+Alt+P riprende)",
                    pd, pt);
         b1[511] = 0;
@@ -5262,11 +5370,19 @@ static void paint(HDC dc, const RECT *cl)
             WCHAR bn[220];
             int y0 = S(108), y1 = S(126);
             _snwprintf(bn, 219, g_srcEverOk ? L"App chiusa: in attesa di %ls\u2026 (registra silenzio)"
+                                            : now_ms() < g_srcMsgUntil ? L"Sorgente cambiata: %ls non \u00E8 in esecuzione, in attesa\u2026 (registra silenzio)"
                                             : L"%ls non \u00E8 in esecuzione: in attesa\u2026 (registra silenzio)", g_curSrcName);
             bn[219] = 0;
             fill_rect(dc, S(16), y0, S(444), y1, RGB(255, 237, 213));
             fill_rect(dc, S(16), y0, S(19), y1, orange);
             draw_text(dc, g_fSmall, RGB(154, 52, 18), 24, 108, 440, 126, bn, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+            b1[0] = 0;
+        } else if (now_ms() < g_srcMsgUntil) {   /* "Sorgente cambiata: ..." for a few seconds */
+            int y0 = S(108), y1 = S(126);
+            fill_rect(dc, S(16), y0, S(444), y1, g_srcMsgWarn ? RGB(255, 237, 213) : RGB(220, 252, 231));
+            fill_rect(dc, S(16), y0, S(19), y1, g_srcMsgWarn ? orange : green);
+            draw_text(dc, g_fSmall, g_srcMsgWarn ? RGB(154, 52, 18) : RGB(22, 101, 52), 24, 108, 440, 126, g_srcMsg,
+                      DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
             b1[0] = 0;
         } else if (silent) {                      /* clear blue banner, distinct from the orange manual pause */
             WCHAR bn[200];
@@ -5528,7 +5644,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             }
             return 0;
         case IDC_FOLDER: if (!g_recording) pick_folder(); return 0;
-        case IDC_SRCBTN: if (!g_recording && !g_pending && !g_stopping) src_menu(h); return 0;
+        case IDC_SRCBTN: if (!g_stopping && !g_exitWhenIdle) src_menu(h); return 0;
         case IDC_OPEN:   open_folder(); return 0;
         case IDC_SETTINGS:
             DialogBoxParamW(g_hinst, MAKEINTRESOURCEW(IDD_SETTINGS), h, settings_proc, 0);
@@ -5607,9 +5723,15 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (r > 0) { g_meterDb = (r - 20000) / 100.0; g_meterStale = 0; }
             else if (++g_meterStale > 3) g_meterDb = -120.0;
             if (g_recording) update_title();
-            if (g_recording && g_srcState != g_srcBtnState) src_button_update();
+            if (g_recording) src_button_update();          /* cheap: only redraws when the text changes */
             if (g_recording || g_convPending) InvalidateRect(h, NULL, FALSE);
-            if (InterlockedExchange(&g_srcNotice, 0)) {
+            if (g_srcNotice && g_srcSwitches > 0) {     /* after a live switch: never modal mid-recording */
+                WCHAR nm[128];
+                InterlockedExchange(&g_srcNotice, 0);
+                EnterCriticalSection(&g_statusLock); wcscpy(nm, g_curSrcName); LeaveCriticalSection(&g_statusLock);
+                src_msg(1, 10000, L"Solo %ls non \u00E8 possibile su questo PC: registra tutto il sistema", nm);
+                log_msg(L"Source switch: process loopback unavailable, whole system (shown in the window)");
+            } else if (InterlockedExchange(&g_srcNotice, 0)) {
                 WCHAR m[900], e[640];
                 _snwprintf(m, 899, L"Non \u00E8 possibile registrare solo l'audio di %ls su questo PC "
                            L"(serve Windows 10 versione 2004 o successiva).\n\nLa registrazione continua con tutto il sistema.\n\n%ls",
@@ -5716,6 +5838,8 @@ typedef struct {
     int nChg, chgDone;                 /* --silence-change-at S:on,db,min,pad (live settings change) */
     int nRen, renDone;                 /* --rename-at S:Name (simulates typing a new name) */
     int renAt[4]; WCHAR renName[4][128];
+    int nSw, swDone;                   /* --source-switch-at S:EXE|S:system (live source switch) */
+    int swAt[4]; WCHAR swExe[4][64];
     int chgAt[8], chgOn[8], chgDb[8], chgMin[8], chgPad[8];
 } TestOpts;
 
@@ -5855,6 +5979,16 @@ static int run_test(int seconds, const WCHAR *outArg, const WCHAR *nameArg, cons
             live_save_name(finalName);
             rename_request(finalName);
         }
+        while (((TestOpts *)t)->swDone < t->nSw && el >= t->swAt[t->swDone] * 1000LL) {
+            int k = ((TestOpts *)t)->swDone++;
+            WCHAR nm[128] = L"";
+            const WCHAR *ex = _wcsicmp(t->swExe[k], L"system") ? t->swExe[k] : L"";
+            DWORD pid = ex[0] ? src_find_root(ex) : 0;
+            if (ex[0]) { if (pid) proc_friendly(pid, ex, nm, 128); else wcsncpy(nm, ex, 127); }
+            log_msg(L"TEST source switch at %.1f s to %ls%ls (timer %.2f s)", el / 1000.0, ex[0] ? nm : L"whole system",
+                    ex[0] && !pid ? L" (not running)" : L"", file_ms() / 1000.0);
+            src_switch_request(ex, nm);
+        }
         if (t->suspendAfter > 0 && el >= t->suspendAfter * 1000LL) { request_stop(6); break; }
     }
     if (t->nRen > 0 || finalName[0]) {   /* while still recording: is the open file already named? */
@@ -5883,11 +6017,11 @@ static int run_test(int seconds, const WCHAR *outArg, const WCHAR *nameArg, cons
         static const WCHAR *st[4] = { L"system", L"app", L"waiting", L"fallback-system" };
         WCHAR e[640];
         log_msg(L"RESULT_SOURCE %ls requested=\"%ls\" name=\"%ls\" state=%ls attached=%ld exits=%ld activation_failures=%ld "
-                L"last_pid=%ld captured=%.2fs synthesized=%.2fs last_error=%ls",
+                L"last_pid=%ld captured=%.2fs synthesized=%.2fs switches=%ld/%d last_error=%ls",
                 (!g_curSrcExe[0] || g_srcState == 1 || g_srcState == 3 || g_srcState == 2) ? L"OK" : L"FAIL",
                 g_curSrcExe, g_curSrcName, st[g_srcState & 3], (long)g_srcAttaches, (long)g_srcExits, (long)g_srcActFails,
                 (long)g_srcPid, (double)(g_framesOut - g_framesPadded) / OUT_RATE, (double)g_framesPadded / OUT_RATE,
-                g_srcLastHr == S_OK ? L"none" : hr_str(g_srcLastHr, e, 640));
+                (long)g_srcSwitches, t->nSw, g_srcLastHr == S_OK ? L"none" : hr_str(g_srcLastHr, e, 640));
     }
     {   /* the big timer shown in the UI must match what was actually written */
         double uiSec;
@@ -6013,6 +6147,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
     g_stopEvent       = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_doneEvent       = CreateEventW(NULL, TRUE, TRUE, NULL);
     g_devChangedEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_srcSwitchEvent  = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_ring = (BYTE *)VirtualAlloc(NULL, RING_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!g_stopEvent || !g_doneEvent || !g_devChangedEvent || !g_ring) return 10;
 
@@ -6061,6 +6196,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
         else if (!wcscmp(argv[i], L"--silence-min") && i + 1 < argc) optSilMin = _wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--silence-pad") && i + 1 < argc) optSilPad = _wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--source-exe") && i + 1 < argc) { wcsncpy(g_startSrcExe, argv[++i], 63); g_startSrcExe[63] = 0; }
+        else if (!wcscmp(argv[i], L"--source-switch-at") && i + 1 < argc) {
+            const WCHAR *a = argv[++i], *c = wcschr(a, L':');
+            if (c && c[1] && topt.nSw < 4) {
+                topt.swAt[topt.nSw] = _wtoi(a);
+                wcsncpy(topt.swExe[topt.nSw], c + 1, 63); topt.swExe[topt.nSw][63] = 0;
+                topt.nSw++;
+            }
+        }
         else if (!wcscmp(argv[i], L"--list-sources")) optListSrc = 1;
         else if (!wcscmp(argv[i], L"--force-proc-fail")) g_forceProcFail = 1;
         else if (!wcscmp(argv[i], L"--open-source-menu")) g_openSrcMenu = 1;
