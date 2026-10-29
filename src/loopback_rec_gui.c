@@ -28,6 +28,13 @@
  *   [--synth S,Q]  (replace captured audio with S s tone / Q s silence, for testing)
  *   [--silence-change-at S:on,db,min,pad]  (up to 8: change the silence cut live at S s)
  *   [--rename-at S:Name]  (up to 4: type a new name at S s; the files are renamed live)
+ *   [--source-exe NAME]   (record only one app, e.g. chrome.exe, via process loopback)
+ *   --list-sources --out <folder>  (log the apps the source picker would offer, then exit)
+ *
+ * Source (1.4): "Tutto il sistema" = WASAPI loopback of the default output device, or one
+ * app = Windows 10 2004+/11 process loopback (VAD\Process_Loopback, include process tree)
+ * on the app's root process, so every child process (e.g. the browser's audio service) is
+ * included. A single browser tab cannot be isolated: Windows has no API for it.
  */
 #ifndef UNICODE
 #define UNICODE
@@ -62,7 +69,8 @@
 #include <string.h>
 #include <wchar.h>
 #include <math.h>
-#include <math.h>
+#include <tlhelp32.h>
+#include <audiopolicy.h>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "ole32.lib")
@@ -90,6 +98,11 @@ static const GUID MY_IID_IMFTransform         = {0xBF94C121,0x5B05,0x4E6F,{0x80,
 static const GUID MY_FOLDERID_Documents       = {0xFDD39AD0,0x238F,0x46AF,{0xAD,0xB4,0x6C,0x85,0x48,0x03,0x69,0xC7}};
 static const PROPERTYKEY MY_PKEY_Device_FriendlyName =
     {{0xA45C254E,0xDF1C,0x4EFD,{0x80,0x20,0x67,0xD1,0x46,0xA8,0x50,0xE0}}, 14};
+
+static const GUID MY_IID_IAudioSessionManager2 = {0x77AA99A0,0x1BD6,0x484F,{0x8B,0xC7,0x2C,0x65,0x4C,0x9A,0x9B,0x6F}};
+static const GUID MY_IID_IAudioSessionControl2 = {0xBFB7FF88,0x7239,0x4FC9,{0x8F,0xA2,0x07,0xC9,0x50,0xBE,0x9C,0x6D}};
+static const GUID MY_IID_IActivateCompletion   = {0x41D949AB,0x9862,0x444A,{0x80,0xF6,0xC2,0x61,0x33,0x4D,0xA5,0xEB}};
+static const GUID MY_IID_IAgileObject          = {0x94EA2B94,0xE9CC,0x49E0,{0xC0,0xFF,0xEE,0x64,0xCA,0x8F,0x5B,0x90}};
 
 static int guid_eq(const GUID *a, const GUID *b) { return memcmp(a, b, sizeof(GUID)) == 0; }
 
@@ -1001,6 +1014,9 @@ typedef struct {
     IAudioRenderClient  *renc;
     UINT32               renFrames;
     int                  capStarted, renStarted;
+    int                  proc;          /* 1 = process loopback of one app */
+    DWORD                pid;           /* its root process */
+    HANDLE               hProc, evt;
 } Dev;
 
 #define SAFE_RELEASE(p, T) do { if (p) { T##_Release(p); (p) = NULL; } } while (0)
@@ -1018,6 +1034,8 @@ static void dev_close(Dev *d)
     SAFE_RELEASE(d->en,   IMMDeviceEnumerator);
     if (d->wfx) { CoTaskMemFree(d->wfx); d->wfx = NULL; }
     if (d->id)  { CoTaskMemFree(d->id);  d->id = NULL; }
+    if (d->hProc) { CloseHandle(d->hProc); d->hProc = NULL; }
+    if (d->evt)   { CloseHandle(d->evt);   d->evt = NULL; }
     d->renFrames = 0;
 }
 
@@ -1140,6 +1158,360 @@ static int default_still_same(Dev *d)
     return same;
 }
 
+/* ------------------------------------------------------------------ */
+/* Source = one app: process helpers + process loopback (1.4)          */
+/* ------------------------------------------------------------------ */
+static WCHAR g_curSrcExe[64], g_curSrcName[128];   /* this session: "" = whole system */
+static WCHAR g_startSrcExe[64], g_startSrcName[128]; /* source for the next new session (set by the UI / test) */
+static int   g_testMode;             /* headless test: never touch the GUI's log/settings/session */
+static int   g_openSrcMenu;          /* --open-source-menu: open the picker at start (screenshots) */
+static volatile LONG g_srcState;     /* 0 system, 1 app attached, 2 waiting for the app, 3 fell back to system */
+static volatile LONG g_srcEverOk;    /* app was attached at least once in this run */
+static volatile LONG g_srcNotice;    /* UI: show "process loopback unavailable" once */
+static volatile LONG g_srcAttaches, g_srcActFails, g_srcExits;
+static volatile LONG g_srcPid;
+static HRESULT g_srcLastHr;
+
+typedef struct { DWORD pid, ppid; WCHAR exe[64]; } PInfo;
+
+static int proc_snap(PInfo **out)
+{
+    HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe;
+    int n = 0, cap = 0;
+    PInfo *p = NULL;
+    *out = NULL;
+    if (sn == INVALID_HANDLE_VALUE) return 0;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(sn, &pe)) do {
+        if (n == cap) {
+            PInfo *np = (PInfo *)realloc(p, (size_t)(cap = cap ? cap * 2 : 256) * sizeof(PInfo));
+            if (!np) break;
+            p = np;
+        }
+        p[n].pid = pe.th32ProcessID; p[n].ppid = pe.th32ParentProcessID;
+        wcsncpy(p[n].exe, pe.szExeFile, 63); p[n].exe[63] = 0;
+        n++;
+    } while (Process32NextW(sn, &pe));
+    CloseHandle(sn);
+    *out = p;
+    return n;
+}
+static int pi_find(const PInfo *p, int n, DWORD pid)
+{
+    int i;
+    for (i = 0; i < n; i++) if (p[i].pid == pid) return i;
+    return -1;
+}
+static ULONG64 proc_ctime(DWORD pid)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    FILETIME c, e, k, u;
+    ULONG64 t = 0;
+    if (!h) return 0;
+    if (GetProcessTimes(h, &c, &e, &k, &u)) t = ((ULONG64)c.dwHighDateTime << 32) | c.dwLowDateTime;
+    CloseHandle(h);
+    return t;
+}
+/* processes that are never "the app" (a WebView2 started by them stays its own app) */
+static int proc_is_shell(const WCHAR *exe)
+{
+    static const WCHAR *k[] = { L"explorer.exe", L"svchost.exe", L"services.exe", L"sihost.exe", L"runtimebroker.exe",
+        L"wininit.exe", L"winlogon.exe", L"applicationframehost.exe", L"dllhost.exe", L"taskhostw.exe", L"system", NULL };
+    int i;
+    for (i = 0; k[i]; i++) if (!_wcsicmp(exe, k[i])) return 1;
+    return 0;
+}
+/* hidden / system processes left out of the picker */
+static int proc_hidden(const WCHAR *exe)
+{
+    static const WCHAR *k[] = { L"loopback_rec_gui.exe", L"audiodg.exe", L"shellexperiencehost.exe", L"searchhost.exe",
+        L"startmenuexperiencehost.exe", L"textinputhost.exe", L"lockapp.exe", L"systemsettings.exe", L"ctfmon.exe",
+        L"searchapp.exe", L"widgets.exe", L"phoneexperiencehost.exe", L"csrss.exe", L"dwm.exe", NULL };
+    int i;
+    if (proc_is_shell(exe)) return 1;
+    for (i = 0; k[i]; i++) if (!_wcsicmp(exe, k[i])) return 1;
+    return 0;
+}
+/* root of an app: walk up while the parent is the same exe (browser -> its renderer/audio
+   children), and past a WebView2 to the app that hosts it (e.g. the new Teams). Creation
+   times guard against a recycled parent PID. */
+static int proc_root_idx(const PInfo *p, int n, int i)
+{
+    int depth;
+    if (i < 0) return i;
+    for (depth = 0; depth < 32; depth++) {
+        int j = pi_find(p, n, p[i].ppid), webview;
+        ULONG64 cj, ci;
+        if (j < 0 || j == i || p[i].ppid == 0) break;
+        webview = !_wcsicmp(p[i].exe, L"msedgewebview2.exe");
+        if (_wcsicmp(p[j].exe, p[i].exe) && !(webview && !proc_is_shell(p[j].exe))) break;
+        cj = proc_ctime(p[j].pid); ci = proc_ctime(p[i].pid);
+        if (!cj || (ci && cj > ci)) break;
+        i = j;
+    }
+    return i;
+}
+/* friendly app name: FileDescription of the exe ("Google Chrome"), else the file name */
+static void proc_friendly(DWORD pid, const WCHAR *exe, WCHAR *out, size_t cch)
+{
+    WCHAR path[MAX_PATH * 2];
+    DWORD len = MAX_PATH * 2, dummy = 0, vs;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    size_t L;
+    out[0] = 0;
+    if (h) {
+        if (QueryFullProcessImageNameW(h, 0, path, &len) && (vs = GetFileVersionInfoSizeW(path, &dummy)) > 0) {
+            BYTE *vi = (BYTE *)malloc(vs);
+            if (vi && GetFileVersionInfoW(path, 0, vs, vi)) {
+                struct { WORD lang, cp; } *tr = NULL;
+                UINT tl = 0, dl = 0;
+                WCHAR q[64], *desc = NULL;
+                if (VerQueryValueW(vi, L"\\VarFileInfo\\Translation", (void **)&tr, &tl) && tl >= 4) {
+                    _snwprintf(q, 63, L"\\StringFileInfo\\%04x%04x\\FileDescription", tr->lang, tr->cp); q[63] = 0;
+                    if (!VerQueryValueW(vi, q, (void **)&desc, &dl)) desc = NULL;
+                }
+                if (!desc || !dl || !desc[0]) {
+                    if (!VerQueryValueW(vi, L"\\StringFileInfo\\040904b0\\FileDescription", (void **)&desc, &dl)) desc = NULL;
+                }
+                if (desc && dl && desc[0]) { wcsncpy(out, desc, cch - 1); out[cch - 1] = 0; }
+            }
+            free(vi);
+        }
+        CloseHandle(h);
+    }
+    /* trim, and fall back to the file name without ".exe" */
+    L = wcslen(out);
+    while (L && out[L - 1] == L' ') out[--L] = 0;
+    if (!out[0] || L > 60) {
+        wcsncpy(out, exe, cch - 1); out[cch - 1] = 0;
+        L = wcslen(out);
+        if (L > 4 && !_wcsicmp(out + L - 4, L".exe")) out[L - 4] = 0;
+    }
+}
+/* PIDs of all audio sessions on the active render devices (COM must be initialized) */
+static int sess_pids(DWORD *pids, int *active, int max)
+{
+    IMMDeviceEnumerator *en = NULL;
+    IMMDeviceCollection *col = NULL;
+    UINT nd = 0, di;
+    int n = 0;
+    if (FAILED(CoCreateInstance(&MY_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &MY_IID_IMMDeviceEnumerator, (void **)&en))) return 0;
+    if (SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &col))) IMMDeviceCollection_GetCount(col, &nd);
+    for (di = 0; di < nd && n < max; di++) {
+        IMMDevice *dev = NULL;
+        IAudioSessionManager2 *sm = NULL;
+        IAudioSessionEnumerator *se = NULL;
+        int cnt = 0, k;
+        if (FAILED(IMMDeviceCollection_Item(col, di, &dev))) continue;
+        if (SUCCEEDED(IMMDevice_Activate(dev, &MY_IID_IAudioSessionManager2, CLSCTX_ALL, NULL, (void **)&sm)) &&
+            SUCCEEDED(IAudioSessionManager2_GetSessionEnumerator(sm, &se)) && SUCCEEDED(IAudioSessionEnumerator_GetCount(se, &cnt))) {
+            for (k = 0; k < cnt && n < max; k++) {
+                IAudioSessionControl *sc = NULL;
+                IAudioSessionControl2 *s2 = NULL;
+                DWORD pid = 0;
+                AudioSessionState st = AudioSessionStateInactive;
+                if (FAILED(IAudioSessionEnumerator_GetSession(se, k, &sc))) continue;
+                if (SUCCEEDED(IAudioSessionControl_QueryInterface(sc, &MY_IID_IAudioSessionControl2, (void **)&s2))) {
+                    if (IAudioSessionControl2_IsSystemSoundsSession(s2) != S_OK &&
+                        SUCCEEDED(IAudioSessionControl2_GetProcessId(s2, &pid)) && pid &&
+                        SUCCEEDED(IAudioSessionControl_GetState(sc, &st)) && st != AudioSessionStateExpired) {
+                        int j, dup = 0;
+                        for (j = 0; j < n; j++) if (pids[j] == pid) { dup = 1; if (st == AudioSessionStateActive) active[j] = 1; }
+                        if (!dup) { pids[n] = pid; active[n] = st == AudioSessionStateActive; n++; }
+                    }
+                    IAudioSessionControl2_Release(s2);
+                }
+                IAudioSessionControl_Release(sc);
+            }
+        }
+        if (se) IAudioSessionEnumerator_Release(se);
+        if (sm) IAudioSessionManager2_Release(sm);
+        IMMDevice_Release(dev);
+    }
+    if (col) IMMDeviceCollection_Release(col);
+    IMMDeviceEnumerator_Release(en);
+    return n;
+}
+
+/* current root PID of an app by exe name (0 = not running). With several instances the
+   one playing audio wins, then the oldest. */
+static DWORD src_find_root(const WCHAR *exe)
+{
+    PInfo *p = NULL;
+    int n = proc_snap(&p), i, nr = 0, k;
+    int roots[16];
+    DWORD best = 0;
+    if (!exe[0] || n <= 0) { free(p); return 0; }
+    for (i = 0; i < n; i++) {
+        int r, dup = 0;
+        if (_wcsicmp(p[i].exe, exe) && _wcsicmp(p[i].exe, L"msedgewebview2.exe")) continue;
+        r = proc_root_idx(p, n, i);
+        if (r < 0 || _wcsicmp(p[r].exe, exe)) continue;
+        for (k = 0; k < nr; k++) if (roots[k] == r) dup = 1;
+        if (!dup && nr < 16) roots[nr++] = r;
+    }
+    if (nr == 1) best = p[roots[0]].pid;
+    else if (nr > 1) {
+        DWORD sp[64]; int sa[64], ns = sess_pids(sp, sa, 64), j, bestScore = -1;
+        ULONG64 bestT = 0;
+        for (k = 0; k < nr; k++) {
+            int score = 0;
+            ULONG64 t;
+            for (j = 0; j < ns; j++) {
+                int si = pi_find(p, n, sp[j]);
+                if (si >= 0 && proc_root_idx(p, n, si) == roots[k]) score = sa[j] ? 2 : (score > 1 ? score : 1);
+            }
+            t = proc_ctime(p[roots[k]].pid);
+            if (score > bestScore || (score == bestScore && t && (!bestT || t < bestT))) { bestScore = score; bestT = t; best = p[roots[k]].pid; }
+        }
+    }
+    free(p);
+    return best;
+}
+
+/* ---- ActivateAudioInterfaceAsync on VAD\Process_Loopback ---- */
+typedef struct { DWORD TargetProcessId; int ProcessLoopbackMode; } MY_PROCESS_LOOPBACK_PARAMS;
+typedef struct { int ActivationType; MY_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams; } MY_ACTIVATION_PARAMS;
+#define MY_ACTIVATION_TYPE_PROCESS_LOOPBACK 1
+#define MY_PROCESS_LOOPBACK_MODE_INCLUDE_TREE 0
+typedef HRESULT (WINAPI *PFN_ActivateAudioInterfaceAsync)(LPCWSTR, REFIID, PROPVARIANT *,
+    IActivateAudioInterfaceCompletionHandler *, IActivateAudioInterfaceAsyncOperation **);
+
+typedef struct { IActivateAudioInterfaceCompletionHandler iface; volatile LONG ref; HANDLE done; } ActHandler;
+static HRESULT STDMETHODCALLTYPE ah_QueryInterface(IActivateAudioInterfaceCompletionHandler *This, REFIID riid, void **ppv)
+{
+    if (!ppv) return E_POINTER;
+    if (guid_eq(riid, &MY_IID_IUnknown) || guid_eq(riid, &MY_IID_IActivateCompletion) || guid_eq(riid, &MY_IID_IAgileObject)) {
+        *ppv = This; InterlockedIncrement(&((ActHandler *)This)->ref); return S_OK;
+    }
+    *ppv = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE ah_AddRef(IActivateAudioInterfaceCompletionHandler *This) { return (ULONG)InterlockedIncrement(&((ActHandler *)This)->ref); }
+static ULONG STDMETHODCALLTYPE ah_Release(IActivateAudioInterfaceCompletionHandler *This)
+{
+    ActHandler *a = (ActHandler *)This;
+    LONG r = InterlockedDecrement(&a->ref);
+    if (r == 0) { CloseHandle(a->done); free(a); }
+    return (ULONG)r;
+}
+static HRESULT STDMETHODCALLTYPE ah_ActivateCompleted(IActivateAudioInterfaceCompletionHandler *This, IActivateAudioInterfaceAsyncOperation *op)
+{
+    (void)op;
+    SetEvent(((ActHandler *)This)->done);
+    return S_OK;
+}
+static IActivateAudioInterfaceCompletionHandlerVtbl g_ahVtbl = { ah_QueryInterface, ah_AddRef, ah_Release, ah_ActivateCompleted };
+
+static int g_forceProcFail;          /* test: --force-proc-fail */
+static HRESULT proc_activate(DWORD pid, IAudioClient **out)
+{
+    static PFN_ActivateAudioInterfaceAsync fn;
+    static int loaded;
+    MY_ACTIVATION_PARAMS ap;
+    PROPVARIANT pv;
+    ActHandler *a;
+    IActivateAudioInterfaceAsyncOperation *op = NULL;
+    HRESULT hr;
+    *out = NULL;
+    if (g_forceProcFail) return E_NOTIMPL;
+    if (!loaded) {
+        HMODULE m = LoadLibraryExW(L"mmdevapi.dll", NULL, 0x00000800 /* LOAD_LIBRARY_SEARCH_SYSTEM32 */);
+        if (!m) m = LoadLibraryW(L"mmdevapi.dll");
+        fn = m ? (PFN_ActivateAudioInterfaceAsync)(void (*)(void))GetProcAddress(m, "ActivateAudioInterfaceAsync") : NULL;
+        loaded = 1;
+    }
+    if (!fn) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    memset(&ap, 0, sizeof(ap));
+    ap.ActivationType = MY_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+    ap.ProcessLoopbackParams.TargetProcessId = pid;
+    ap.ProcessLoopbackParams.ProcessLoopbackMode = MY_PROCESS_LOOPBACK_MODE_INCLUDE_TREE;
+    PropVariantInit(&pv);
+    pv.vt = VT_BLOB; pv.blob.cbSize = sizeof(ap); pv.blob.pBlobData = (BYTE *)&ap;
+    a = (ActHandler *)calloc(1, sizeof(*a));
+    if (!a) return E_OUTOFMEMORY;
+    a->iface.lpVtbl = &g_ahVtbl; a->ref = 1;
+    a->done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!a->done) { free(a); return E_OUTOFMEMORY; }
+    hr = fn(L"VAD\\Process_Loopback", &MY_IID_IAudioClient, &pv, &a->iface, &op);
+    if (SUCCEEDED(hr) && op) {
+        if (WaitForSingleObject(a->done, 5000) != WAIT_OBJECT_0) hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        else {
+            HRESULT ar = E_FAIL;
+            IUnknown *u = NULL;
+            hr = IActivateAudioInterfaceAsyncOperation_GetActivateResult(op, &ar, &u);
+            if (SUCCEEDED(hr)) hr = ar;
+            if (SUCCEEDED(hr)) hr = u ? IUnknown_QueryInterface(u, &MY_IID_IAudioClient, (void **)out) : E_NOINTERFACE;
+            if (u) IUnknown_Release(u);
+        }
+        IActivateAudioInterfaceAsyncOperation_Release(op);
+    } else if (SUCCEEDED(hr)) hr = E_FAIL;
+    ah_Release(&a->iface);
+    return hr;
+}
+
+/* open a capture of one app (its whole process tree). Process loopback has no mix format:
+   ask for 48 kHz / 16-bit / stereo and let the audio engine convert. */
+static HRESULT proc_open(Dev *d, Conv *c, DWORD pid)
+{
+    HRESULT hr;
+    WCHAR desc[128], name[256];
+    UINT32 bufFrames = 0;
+    WAVEFORMATEX *w;
+    memset(d, 0, sizeof(*d));
+    d->proc = 1; d->pid = pid;
+    d->hProc = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    hr = proc_activate(pid, &d->cap);
+    if (FAILED(hr)) { LOG_HR(L"ActivateAudioInterfaceAsync(process loopback)", hr); goto fail; }
+    w = (WAVEFORMATEX *)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+    if (!w) { hr = E_OUTOFMEMORY; goto fail; }
+    memset(w, 0, sizeof(*w));
+    w->wFormatTag = WAVE_FORMAT_PCM; w->nChannels = 2; w->nSamplesPerSec = OUT_RATE; w->wBitsPerSample = 16;
+    w->nBlockAlign = 4; w->nAvgBytesPerSec = OUT_RATE * 4;
+    d->wfx = w;
+    if (!parse_format(d->wfx, c, desc, 128)) { hr = AUDCLNT_E_UNSUPPORTED_FORMAT; goto fail; }
+    d->evt = CreateEventW(NULL, FALSE, FALSE, NULL);
+    hr = IAudioClient_Initialize(d->cap, AUDCLNT_SHAREMODE_SHARED,
+                                 AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                                 CAPTURE_BUF_HNS, 0, d->wfx, NULL);
+    if (FAILED(hr)) { LOG_HR(L"IAudioClient::Initialize(process loopback)", hr); goto fail; }
+    hr = IAudioClient_SetEventHandle(d->cap, d->evt);
+    if (FAILED(hr)) { LOG_HR(L"SetEventHandle(process loopback)", hr); goto fail; }
+    if (FAILED(IAudioClient_GetBufferSize(d->cap, &bufFrames)) || bufFrames == 0) bufFrames = OUT_RATE;
+    if (!ensure_cap((void **)&c->tmp, &c->tmpCap, (size_t)bufFrames * 2 + 64, 2 * sizeof(float)) ||
+        !ensure_cap((void **)&c->out, &c->outCap, (size_t)bufFrames * 2 + 64, 2 * sizeof(short))) {
+        hr = E_OUTOFMEMORY; goto fail;
+    }
+    hr = IAudioClient_GetService(d->cap, &MY_IID_IAudioCaptureClient, (void **)&d->capc);
+    if (FAILED(hr)) { LOG_HR(L"GetService(IAudioCaptureClient, process loopback)", hr); goto fail; }
+    hr = IAudioClient_Start(d->cap);
+    if (FAILED(hr)) { LOG_HR(L"IAudioClient::Start(process loopback)", hr); goto fail; }
+    d->capStarted = 1;
+    _snwprintf(name, 255, L"App: %ls", g_curSrcName[0] ? g_curSrcName : g_curSrcExe); name[255] = 0;
+    EnterCriticalSection(&g_statusLock);
+    wcsncpy(g_devName, name, 255); g_devName[255] = 0;
+    wcsncpy(g_fmtDesc, desc, 127); g_fmtDesc[127] = 0;
+    LeaveCriticalSection(&g_statusLock);
+    log_msg(L"Capturing app: %ls (%ls, root PID %lu, include process tree)  [%ls]", g_curSrcName, g_curSrcExe,
+            (unsigned long)pid, desc);
+    return S_OK;
+fail:
+    dev_close(d);
+    return FAILED(hr) ? hr : E_FAIL;
+}
+
+/* is the captured app still running? */
+static int proc_alive(Dev *d)
+{
+    if (d->hProc) return WaitForSingleObject(d->hProc, 0) == WAIT_TIMEOUT;
+    {
+        PInfo *p = NULL;
+        int n = proc_snap(&p), alive = pi_find(p, n, d->pid) >= 0;
+        free(p);
+        return alive;
+    }
+}
+
 static void atomic_max(volatile LONG *p, LONG v)
 {
     LONG cur = *p;
@@ -1221,6 +1593,10 @@ static HRESULT drain(Dev *d, Conv *c, int *gotPacket)
         if (flagged) InterlockedIncrement(&g_discont);
 
         /* keep the file aligned with the QPC timeline */
+        if (d->proc && qpc != 0) {            /* app capture: trust only plausible timestamps */
+            LONG64 off = t100_to_frames((LONG64)qpc) - t100_to_frames(now_100ns());
+            if (off > MS_TO_FRAMES(1000) || off < -MS_TO_FRAMES(3000)) qpc = 0;
+        }
         if (!(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) && qpc != 0) {
             LONG64 ideal = t100_to_frames((LONG64)qpc);
             LONG64 diff  = ideal - g_framesOut;               /* >0: file is behind */
@@ -1309,7 +1685,48 @@ static unsigned __stdcall capture_thread(void *arg)
         HANDLE waits[2];
 
         ResetEvent(g_devChangedEvent);
-        hr = dev_open(&d, &conv);
+        if (g_curSrcExe[0] && g_srcState != 3) {
+            /* one app: find its root process, wait (recording silence) while it is not running */
+            DWORD pid = src_find_root(g_curSrcExe);
+            if (!pid) {
+                LONG64 until;
+                if (g_srcState != 2) log_msg(L"Source app %ls (%ls) not running: recording silence, checking every 2 s",
+                                                     g_curSrcName, g_curSrcExe);
+                InterlockedExchange(&g_srcState, 2);
+                InterlockedExchange(&g_haveDevice, 0);
+                InterlockedExchange(&g_srcPid, 0);
+                EnterCriticalSection(&g_statusLock);
+                _snwprintf(g_devName, 255, L"In attesa di %ls", g_curSrcName); g_devName[255] = 0; g_fmtDesc[0] = 0;
+                LeaveCriticalSection(&g_statusLock);
+                until = now_ms() + DEVCHECK_MS;
+                while (now_ms() < until) {
+                    if (!pause_active()) pad_to_now(&conv);
+                    if (WaitForSingleObject(g_stopEvent, 100) == WAIT_OBJECT_0) break;
+                }
+                continue;
+            }
+            hr = proc_open(&d, &conv, pid);
+            if (FAILED(hr)) {
+                g_srcLastHr = hr;
+                InterlockedIncrement(&g_srcActFails);
+                if (!g_srcEverOk && g_srcActFails >= 2) {
+                    /* process loopback not available here (older Windows / Wine): whole system */
+                    WCHAR b[640];
+                    log_msg(L"Process loopback unavailable (%ls): FALLING BACK to whole-system capture", hr_str(hr, b, 640));
+                    InterlockedExchange(&g_srcState, 3);
+                    InterlockedExchange(&g_srcNotice, 1);
+                    continue;
+                }
+            } else {
+                if (!g_srcEverOk && g_srcState == 2) log_msg(L"Source app started (PID %lu)", (unsigned long)pid);
+                else if (g_srcEverOk) log_msg(L"Source app reattached (PID %lu)", (unsigned long)pid);
+                InterlockedExchange(&g_srcEverOk, 1);
+                InterlockedExchange(&g_srcState, 1);
+                InterlockedExchange(&g_srcPid, (LONG)pid);
+                InterlockedIncrement(&g_srcAttaches);
+                g_srcActFails = 0;
+            }
+        } else hr = dev_open(&d, &conv);
         if (FAILED(hr)) {
             /* no device: keep the timeline moving with silence while we back off */
             LONG64 until;
@@ -1335,7 +1752,7 @@ static unsigned __stdcall capture_thread(void *arg)
         waits[0] = g_stopEvent; waits[1] = g_devChangedEvent;
 
         for (;;) {
-            DWORD w = WaitForMultipleObjects(2, waits, FALSE, POLL_MS);
+            DWORD w = WaitForMultipleObjects(d.proc ? 1 : 2, waits, FALSE, POLL_MS);   /* app capture follows the default device by itself */
             int got = 0;
             LONG64 t;
             if (w == WAIT_OBJECT_0) break;
@@ -1352,7 +1769,14 @@ static unsigned __stdcall capture_thread(void *arg)
             if (d.renc && t - lastPacket >= WATCHDOG_MS) { log_msg(L"No audio packets for %d s, reinitializing", WATCHDOG_MS / 1000); break; }
             if (t - lastCheck >= DEVCHECK_MS) {
                 lastCheck = t;
-                if (!default_still_same(&d)) { log_msg(L"Default output device changed (poll), switching"); break; }
+                if (d.proc) {
+                    if (!proc_alive(&d)) {
+                        log_msg(L"Source app closed (PID %lu): recording silence, waiting for it to start again", (unsigned long)d.pid);
+                        InterlockedIncrement(&g_srcExits);
+                        InterlockedExchange(&g_srcState, 2);
+                        break;
+                    }
+                } else if (!default_still_same(&d)) { log_msg(L"Default output device changed (poll), switching"); break; }
             }
         }
         dev_close(&d);
@@ -2852,6 +3276,7 @@ static int rec_start(const WCHAR *folder, int splitMin, int resume, WCHAR *err, 
     g_framesOut = g_framesPadded = g_framesDropped = g_bytesWritten = 0;
     g_reconnects = g_discont = g_haveDevice = g_writeError = 0;
     g_stopReason = 0; g_peakNow = g_peakMax = 0; g_rmsNow = 0;
+    g_srcState = 0; g_srcEverOk = 0; g_srcNotice = 0; g_srcAttaches = g_srcActFails = g_srcExits = 0; g_srcPid = 0; g_srcLastHr = S_OK;
     ResetEvent(g_stopEvent); ResetEvent(g_doneEvent); ResetEvent(g_devChangedEvent);
     EnterCriticalSection(&g_statusLock);
     wcscpy(g_devName, L"(none)"); g_fmtDesc[0] = 0; g_curPath[0] = 0;
@@ -2867,9 +3292,15 @@ static int rec_start(const WCHAR *folder, int splitMin, int resume, WCHAR *err, 
             SetEvent(g_doneEvent); return 0;
         }
         folder = rFolder;
+        /* the resumed session keeps its source (absent in sessions of <= 1.3.x: whole system) */
+        GetPrivateProfileStringW(L"Session", L"SourceExe", L"", g_curSrcExe, 64, g_sessIni);
+        GetPrivateProfileStringW(L"Session", L"SourceName", L"", g_curSrcName, 128, g_sessIni);
         kbps = (int)sess_get_int(L"Kbps", g_aacKbps);
         mono = sess_get_int(L"Mono", 0) != 0;
     }
+    if (!resume) { wcscpy(g_curSrcExe, g_startSrcExe); wcscpy(g_curSrcName, g_startSrcName); }
+    if (g_curSrcExe[0] && !g_curSrcName[0]) wcsncpy(g_curSrcName, g_curSrcExe, 127);
+    if (!g_curSrcExe[0]) g_curSrcName[0] = 0;
     if (!make_folder(folder, g_wav.folder, err, cch)) { SetEvent(g_doneEvent); return 0; }
     if (!resume) {
         GetLocalTime(&st);
@@ -3006,6 +3437,8 @@ static int rec_start(const WCHAR *folder, int splitMin, int resume, WCHAR *err, 
             sess_put_int(L"Part", 1);
             sess_put_int(L"DoneFrames", 0);
             sess_put_int(L"DoneBytes", 0);
+            sess_put(L"SourceExe", g_curSrcExe[0] ? g_curSrcExe : NULL);
+            sess_put(L"SourceName", g_curSrcExe[0] ? g_curSrcName : NULL);
         } else {
             log_msg(L"RESUMED session %ls part %d, %.2f s already recorded (cut %.2f s, paused %.2f s before)", g_wav.base,
                     g_wav.part, g_resumeBaseMs / 1000.0, g_cutBaseMs / 1000.0, g_pausedBaseMs / 1000.0);
@@ -3016,6 +3449,8 @@ static int rec_start(const WCHAR *folder, int splitMin, int resume, WCHAR *err, 
     log_msg(L"Recording started (split: %d min, part limit %.0f s, AAC after stop: %ls %d kbps %ls, keep WAV %d)",
             splitMin, (double)g_wav.splitBytes / (OUT_RATE * OUT_BPF), g_convEnabled ? L"on" : L"off",
             g_aacKbps, g_mono ? L"mono" : L"stereo", g_keepWav);
+    if (g_curSrcExe[0]) log_msg(L"Source: app %ls (%ls), process loopback incl. child processes", g_curSrcName, g_curSrcExe);
+    else log_msg(L"Source: whole system (default output device)");
     g_start100ns = now_100ns();
     g_sessStartMs = now_ms(); g_sessEndMs = 0;
     InterlockedExchange(&g_recording, 1);
@@ -3431,6 +3866,7 @@ static WCHAR g_saveFolder[MAX_PATH];
 static int   g_splitMin;
 static int   g_winX = CW_USEDEFAULT, g_winY = CW_USEDEFAULT;
 static WCHAR g_template[256] = L"{data} {ora}", g_templateCustom[256];
+static WCHAR g_srcExe[64], g_srcName[128];   /* chosen source: "" = Tutto il sistema */
 
 static void default_folder(WCHAR *out)
 {
@@ -3459,6 +3895,7 @@ static void settings_init(void)
     _snwprintf(g_iniPath, MAX_PATH - 1, L"%ls\\settings.ini", g_appDir);   g_iniPath[MAX_PATH - 1] = 0;
     _snwprintf(g_logPath, MAX_PATH - 1, L"%ls\\log.txt", g_appDir);       g_logPath[MAX_PATH - 1] = 0;
     _snwprintf(g_sessIni, MAX_PATH - 1, L"%ls\\session.ini", g_appDir);   g_sessIni[MAX_PATH - 1] = 0;
+    if (g_testMode) return;          /* headless test: leave the GUI's log and settings alone */
     {
         /* keep the log small: rotate at 1 MB */
         WIN32_FILE_ATTRIBUTE_DATA fa;
@@ -3506,6 +3943,10 @@ static void settings_load(void)
     if (g_silPadMs < 0 || g_silPadMs > 5000) g_silPadMs = 500;
     g_silDb     = (int)GetPrivateProfileIntW(L"Settings", L"SilenceDb", -45, g_iniPath);
     if (g_silDb < -70 || g_silDb > -20) g_silDb = -45;
+    GetPrivateProfileStringW(L"Settings", L"SourceExe", L"", g_srcExe, 64, g_iniPath);
+    GetPrivateProfileStringW(L"Settings", L"SourceName", L"", g_srcName, 128, g_iniPath);
+    if (!g_srcExe[0]) g_srcName[0] = 0;
+    else if (!g_srcName[0]) wcsncpy(g_srcName, g_srcExe, 127);
     {
         int x = (int)GetPrivateProfileIntW(L"Window", L"X", -32000, g_iniPath);
         int y = (int)GetPrivateProfileIntW(L"Window", L"Y", -32000, g_iniPath);
@@ -3538,6 +3979,8 @@ static void settings_save(HWND hwnd)
     ini_int(L"Settings", L"SilenceDb", g_silDb);
     WritePrivateProfileStringW(L"Settings", L"NameTemplate", g_template, g_iniPath);
     WritePrivateProfileStringW(L"Settings", L"NameTemplateCustom", g_templateCustom, g_iniPath);
+    WritePrivateProfileStringW(L"Settings", L"SourceExe", g_srcExe, g_iniPath);
+    WritePrivateProfileStringW(L"Settings", L"SourceName", g_srcExe[0] ? g_srcName : L"", g_iniPath);
     if (hwnd) {
         WINDOWPLACEMENT wp;
         wp.length = sizeof(wp);
@@ -3554,7 +3997,7 @@ static void settings_save(HWND hwnd)
 #define APP_TITLE   L"Loopback Rec"
 #define WND_CLASS   L"LoopbackRecGuiWnd"
 #define CLIENT_W    460
-#define CLIENT_H    344
+#define CLIENT_H    370
 #define IDC_TOGGLE  101
 #define IDC_FOLDER  102
 #define IDC_OPEN    103
@@ -3564,7 +4007,12 @@ static void settings_save(HWND hwnd)
 #define IDC_PAUSE   108
 #define IDC_DISCARD 109
 #define IDC_TPLBTN  110
+#define IDC_SRCBTN  111
 #define IDM_TPL0    500
+#define IDM_SRC_SYS 600         /* "Tutto il sistema" */
+#define IDM_SRC0    601         /* apps: IDM_SRC0 + index */
+#define IDM_SRC_KEEP 690        /* chosen app that is not running now */
+#define IDM_SRC_REFRESH 691
 #define HOTKEY_PAUSE 2
 #define HOTKEY_ID   1
 #define TIMER_UI    1
@@ -3595,7 +4043,7 @@ static void settings_save(HWND hwnd)
 static HINSTANCE g_hinst;
 static HWND  g_hwnd, g_btnToggle, g_btnFolder, g_btnOpen, g_btnSettings, g_editName, g_cbTemplate, g_btnTpl;
 static int   g_tplCustomShown;    /* custom pattern row visible */
-static HWND  g_btnPause, g_btnDiscard;
+static HWND  g_btnPause, g_btnDiscard, g_btnSrc;
 static int   g_hotkeyPOk, g_layoutPending = -1;
 static UINT  g_dpi = 96;
 static HFONT g_fUI, g_fSmall, g_fBig, g_fBtn, g_fBold;
@@ -3702,9 +4150,10 @@ static void layout(void)
     ShowWindow(g_btnDiscard, g_layoutPending ? SW_SHOW : SW_HIDE);
     SendMessageW(g_btnPause, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     SendMessageW(g_btnDiscard, WM_SETFONT, (WPARAM)g_fUI, TRUE);
-    MoveWindow(g_btnFolder,  S(20),  S(284), S(104), S(28), TRUE);
-    MoveWindow(g_btnOpen,    S(130), S(284), S(112), S(28), TRUE);
-    MoveWindow(g_btnSettings,S(326), S(284), S(114), S(28), TRUE);
+    MoveWindow(g_btnFolder,  S(20),  S(310), S(104), S(28), TRUE);
+    MoveWindow(g_btnOpen,    S(130), S(310), S(112), S(28), TRUE);
+    MoveWindow(g_btnSettings,S(326), S(310), S(114), S(28), TRUE);
+    SendMessageW(g_btnSrc, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     SendMessageW(g_btnToggle, WM_SETFONT, (WPARAM)g_fBtn, TRUE);
     SendMessageW(g_btnFolder, WM_SETFONT, (WPARAM)g_fUI, TRUE);
     SendMessageW(g_btnOpen,   WM_SETFONT, (WPARAM)g_fUI, TRUE);
@@ -4132,6 +4581,166 @@ static void tray_remove(void)
     g_trayAdded = 0;
 }
 
+/* ---------------- source picker ---------------- */
+typedef struct { DWORD pid; WCHAR exe[64]; WCHAR name[128]; int session, active; } SrcApp;
+#define SRC_MAX 40
+static SrcApp g_srcApps[SRC_MAX];
+static int    g_srcAppN;
+static WCHAR  g_srcBtnText[200];
+static LONG   g_srcBtnState = -1;
+
+typedef HRESULT (WINAPI *PFN_DwmGetWindowAttribute)(HWND, DWORD, PVOID, DWORD);
+typedef struct { DWORD pids[256]; int n; PFN_DwmGetWindowAttribute dwm; } WinPids;
+static BOOL CALLBACK src_win_cb(HWND h, LPARAM lp)
+{
+    WinPids *w = (WinPids *)lp;
+    DWORD pid = 0, cloaked = 0;
+    int i;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER) || (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+    if (GetWindowTextLengthW(h) <= 0) return TRUE;
+    if (w->dwm && SUCCEEDED(w->dwm(h, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return TRUE;
+    for (i = 0; i < w->n; i++) if (w->pids[i] == pid) return TRUE;
+    if (w->n < 256) w->pids[w->n++] = pid;
+    return TRUE;
+}
+static void src_add(const PInfo *p, int n, int idx, int session, int active)
+{
+    int r = proc_root_idx(p, n, idx), i;
+    if (r < 0 || p[r].pid == GetCurrentProcessId() || proc_hidden(p[r].exe)) return;
+    for (i = 0; i < g_srcAppN; i++) if (!_wcsicmp(g_srcApps[i].exe, p[r].exe)) {
+        if (session) g_srcApps[i].session = 1;
+        if (active) g_srcApps[i].active = 1;
+        return;
+    }
+    if (g_srcAppN >= SRC_MAX) return;
+    {
+        SrcApp *a = &g_srcApps[g_srcAppN++];
+        a->pid = p[r].pid; a->session = session; a->active = active;
+        wcsncpy(a->exe, p[r].exe, 63); a->exe[63] = 0;
+        proc_friendly(p[r].pid, p[r].exe, a->name, 128);
+    }
+}
+static int src_cmp(const SrcApp *a, const SrcApp *b)
+{
+    if (a->session != b->session) return b->session - a->session;
+    if (a->active != b->active) return b->active - a->active;
+    return _wcsicmp(a->name, b->name);
+}
+/* apps with an audio session (any state but expired) + apps with a visible window */
+static void src_enum(void)
+{
+    PInfo *p = NULL;
+    int n = proc_snap(&p), i, j;
+    DWORD sp[64]; int sa[64], ns = sess_pids(sp, sa, 64);
+    WinPids *w = (WinPids *)calloc(1, sizeof(WinPids));
+    g_srcAppN = 0;
+    for (i = 0; i < ns; i++) src_add(p, n, pi_find(p, n, sp[i]), 1, sa[i]);
+    if (w) {
+        HMODULE dm = LoadLibraryW(L"dwmapi.dll");
+        w->dwm = dm ? (PFN_DwmGetWindowAttribute)(void (*)(void))GetProcAddress(dm, "DwmGetWindowAttribute") : NULL;
+        EnumWindows(src_win_cb, (LPARAM)w);
+        for (i = 0; i < w->n; i++) src_add(p, n, pi_find(p, n, w->pids[i]), 0, 0);
+        free(w);
+    }
+    for (i = 1; i < g_srcAppN; i++)        /* insertion sort: playing, then with audio, then by name */
+        for (j = i; j > 0 && src_cmp(&g_srcApps[j], &g_srcApps[j - 1]) < 0; j--) {
+            SrcApp t = g_srcApps[j]; g_srcApps[j] = g_srcApps[j - 1]; g_srcApps[j - 1] = t;
+        }
+    free(p);
+}
+/* the source the window shows: the running/pending session's, else the chosen one */
+static void src_label(WCHAR *out, size_t cch)
+{
+    if (g_recording) {
+        if (!g_curSrcExe[0]) wcsncpy(out, L"Tutto il sistema", cch - 1);
+        else if (g_srcState == 3) _snwprintf(out, cch - 1, L"Tutto il sistema (%ls non supportato)", g_curSrcName);
+        else if (g_srcState == 2) _snwprintf(out, cch - 1, L"%ls (in attesa\u2026)", g_curSrcName);
+        else wcsncpy(out, g_curSrcName, cch - 1);
+    } else if (g_pending) {
+        WCHAR e[64] = L"", nm[128] = L"";
+        GetPrivateProfileStringW(L"Session", L"SourceExe", L"", e, 64, g_sessIni);
+        GetPrivateProfileStringW(L"Session", L"SourceName", L"", nm, 128, g_sessIni);
+        _snwprintf(out, cch - 1, L"%ls (sessione)", e[0] ? (nm[0] ? nm : e) : L"Tutto il sistema");
+    } else wcsncpy(out, g_srcExe[0] ? g_srcName : L"Tutto il sistema", cch - 1);
+    out[cch - 1] = 0;
+}
+static void src_button_update(void)
+{
+    WCHAR lab[160], t[200];
+    if (!g_btnSrc) return;
+    src_label(lab, 160);
+    _snwprintf(t, 199, L"%ls  \u25BE", lab); t[199] = 0;
+    g_srcBtnState = g_srcState;
+    if (wcscmp(t, g_srcBtnText)) {
+        HDC dc = GetDC(g_btnSrc);
+        HGDIOBJ of = SelectObject(dc, g_fUI);
+        SIZE sz = {0, 0};
+        int wpx;
+        GetTextExtentPoint32W(dc, t, (int)wcslen(t), &sz);
+        SelectObject(dc, of);
+        ReleaseDC(g_btnSrc, dc);
+        wpx = sz.cx + S(18);
+        if (wpx > S(366)) wpx = S(366);
+        if (wpx < S(60)) wpx = S(60);
+        wcscpy(g_srcBtnText, t);
+        SetWindowTextW(g_btnSrc, t);
+        MoveWindow(g_btnSrc, S(74), S(258), wpx, S(22), TRUE);
+    }
+}
+static void src_menu(HWND h)
+{
+    for (;;) {
+        HMENU m = CreatePopupMenu(), sub = NULL;
+        RECT br;
+        int i, cmd, anyS = 0, anyW = 0, chosenListed = 0;
+        WCHAR it[200];
+        src_enum();
+        AppendMenuW(m, MF_STRING | (!g_srcExe[0] ? MF_CHECKED : 0), IDM_SRC_SYS, L"Tutto il sistema");
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        for (i = 0; i < g_srcAppN; i++) {
+            int chosen = g_srcExe[0] && !_wcsicmp(g_srcExe, g_srcApps[i].exe);
+            if (chosen) chosenListed = 1;
+            if (g_srcApps[i].session) {
+                _snwprintf(it, 199, L"%ls%ls", g_srcApps[i].name, g_srcApps[i].active ? L"\t\u266A in riproduzione" : L"");
+                it[199] = 0;
+                AppendMenuW(m, MF_STRING | (chosen ? MF_CHECKED : 0), IDM_SRC0 + i, it);
+                anyS = 1;
+            } else {
+                if (!sub) sub = CreatePopupMenu();
+                AppendMenuW(sub, MF_STRING | (chosen ? MF_CHECKED : 0), IDM_SRC0 + i, g_srcApps[i].name);
+                anyW = 1;
+            }
+        }
+        if (!anyS) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(nessuna app sta usando l'audio)");
+        if (g_srcExe[0] && !chosenListed) {
+            _snwprintf(it, 199, L"%ls (non in esecuzione)", g_srcName); it[199] = 0;
+            AppendMenuW(m, MF_STRING | MF_CHECKED, IDM_SRC_KEEP, it);
+        }
+        if (anyW) AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"Altre app aperte");
+        else if (sub) DestroyMenu(sub);
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING, IDM_SRC_REFRESH, L"Aggiorna elenco");
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Una singola scheda del browser non si pu\u00F2 separare");
+        GetWindowRect(g_btnSrc, &br);
+        cmd = (int)TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY, br.left, br.bottom, 0, h, NULL);
+        DestroyMenu(m);
+        if (cmd == IDM_SRC_REFRESH) continue;
+        if (g_recording || g_pending) return;          /* state changed while the menu was open */
+        if (cmd == IDM_SRC_SYS) { g_srcExe[0] = 0; g_srcName[0] = 0; }
+        else if (cmd >= IDM_SRC0 && cmd < IDM_SRC0 + g_srcAppN) {
+            wcscpy(g_srcExe, g_srcApps[cmd - IDM_SRC0].exe);
+            wcscpy(g_srcName, g_srcApps[cmd - IDM_SRC0].name);
+        } else return;
+        settings_save(NULL);
+        log_msg(L"Source set to %ls", g_srcExe[0] ? g_srcName : L"whole system");
+        src_button_update();
+        InvalidateRect(h, NULL, FALSE);
+        return;
+    }
+}
+
 /* ---------------- state ---------------- */
 static void update_controls(void)
 {
@@ -4147,6 +4756,8 @@ static void update_controls(void)
     EnableWindow(g_btnFolder, !rec && !pend);
     EnableWindow(g_cbTemplate, !pend && !g_stopping);
     EnableWindow(g_btnTpl, !pend && !g_stopping);
+    EnableWindow(g_btnSrc, !rec && !pend && !g_stopping && !g_exitWhenIdle);
+    src_button_update();
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
@@ -4248,18 +4859,19 @@ static void apply_state_icon(void)
 
 static void update_title(void)
 {
-    WCHAR t[128], hms[32];
+    WCHAR t[128], hms[32], sx[140] = L"";
+    if (g_recording && g_curSrcExe[0] && g_srcState != 3) { _snwprintf(sx, 139, L" \u00B7 %ls", g_curSrcName); sx[139] = 0; }
     if (g_recording && g_pauseReq) {
         WCHAR pd[24];
         LONG64 st = g_pauseStartMs;
         fmt_dur(pd, 24, st ? now_ms() - st : 0);
         fmt_hms(hms, 32, file_ms());
-        _snwprintf(t, 127, L"PAUSA %ls \u00B7 REC %ls - " APP_TITLE, pd, hms);
+        _snwprintf(t, 127, L"PAUSA %ls \u00B7 REC %ls%ls - " APP_TITLE, pd, hms, sx);
     }
     else if (g_recording && g_gateOn && g_gateCutting) {
         LONG64 ss = atomic_read64(&g_gateRunF) / OUT_RATE;
         fmt_hms(hms, 32, file_ms());
-        _snwprintf(t, 127, L"SILENZIO %d:%02d \u00B7 REC %ls - " APP_TITLE, (int)(ss / 60), (int)(ss % 60), hms);
+        _snwprintf(t, 127, L"SILENZIO %d:%02d \u00B7 REC %ls%ls - " APP_TITLE, (int)(ss / 60), (int)(ss % 60), hms, sx);
     }
     else if (g_recording) {
         LONG64 sr = atomic_read64(&g_silRunF) * 1000 / OUT_RATE;
@@ -4267,8 +4879,8 @@ static void update_title(void)
         if (sr >= 1000 && !g_stopping) {
             WCHAR sd[24];
             fmt_dur(sd, 24, sr);
-            _snwprintf(t, 127, L"\u25CF REC %ls \u00B7 silenzio %ls - " APP_TITLE, hms, sd);
-        } else _snwprintf(t, 127, L"\u25CF REC %ls - " APP_TITLE, hms);
+            _snwprintf(t, 127, L"\u25CF REC %ls \u00B7 silenzio %ls%ls - " APP_TITLE, hms, sd, sx);
+        } else _snwprintf(t, 127, L"\u25CF REC %ls%ls - " APP_TITLE, hms, sx);
     }
     else wcscpy(t, APP_TITLE);
     t[127] = 0;
@@ -4292,6 +4904,21 @@ static void start_recording(int resume)
         MessageBoxW(g_hwnd, L"Spazio su disco insufficiente (meno di 300 MB liberi).\nScegli un'altra cartella.",
                     APP_TITLE, MB_ICONWARNING);
         return;
+    }
+    if (!resume) {
+        wcscpy(g_startSrcExe, g_srcExe); wcscpy(g_startSrcName, g_srcName);
+        if (g_srcExe[0] && !src_find_root(g_srcExe)) {
+            WCHAR m[600];
+            int r;
+            _snwprintf(m, 599, L"%ls non \u00E8 in esecuzione.\n\n"
+                       L"S\u00EC = registra tutto il sistema (solo questa volta)\n"
+                       L"No = avvia comunque: registra silenzio finch\u00E9 %ls non parte, poi la sua audio\n"
+                       L"Annulla = non avviare", g_srcName, g_srcName);
+            m[599] = 0;
+            r = MessageBoxW(g_hwnd, m, APP_TITLE L" - sorgente", MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+            if (r == IDCANCEL) return;
+            if (r == IDYES) { g_startSrcExe[0] = 0; g_startSrcName[0] = 0; }
+        }
     }
     g_tplUseST = 0;
     GetLocalTime(&g_tplST);
@@ -4631,7 +5258,17 @@ static void paint(HDC dc, const RECT *cl)
         else
             _snwprintf(b1, 511, L"%ls%ls%ls  \u00B7  parte %d  \u00B7  riconnessioni %ld  \u00B7  deriva %+.2f s", cut, last,
                        (g_haveDevice && fmt[0]) ? fmt : L"in attesa del dispositivo", g_wav.part, (long)g_reconnects, drift);
-        if (silent) {                      /* clear blue banner, distinct from the orange manual pause */
+        if (g_curSrcExe[0] && g_srcState == 2) {   /* the chosen app is not running: warn (silence is recorded) */
+            WCHAR bn[220];
+            int y0 = S(108), y1 = S(126);
+            _snwprintf(bn, 219, g_srcEverOk ? L"App chiusa: in attesa di %ls\u2026 (registra silenzio)"
+                                            : L"%ls non \u00E8 in esecuzione: in attesa\u2026 (registra silenzio)", g_curSrcName);
+            bn[219] = 0;
+            fill_rect(dc, S(16), y0, S(444), y1, RGB(255, 237, 213));
+            fill_rect(dc, S(16), y0, S(19), y1, orange);
+            draw_text(dc, g_fSmall, RGB(154, 52, 18), 24, 108, 440, 126, bn, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+            b1[0] = 0;
+        } else if (silent) {                      /* clear blue banner, distinct from the orange manual pause */
             WCHAR bn[200];
             size_t cl2 = wcslen(cut);
             int y0 = S(108), y1 = S(126);
@@ -4687,7 +5324,9 @@ static void paint(HDC dc, const RECT *cl)
         draw_text(dc, g_fSmall, green, 20, 108, 440, 126, b1, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         b1[0] = 0;
     } else {
-        wcscpy(b1, L"Registra l'audio di sistema (browser, chiamate). Il microfono non viene registrato.");
+        if (g_srcExe[0]) _snwprintf(b1, 511, L"Registra solo l'audio di %ls (anche i suoi sottoprocessi). Il microfono no.", g_srcName);
+        else wcscpy(b1, L"Registra l'audio di sistema (browser, chiamate). Il microfono non viene registrato.");
+        b1[511] = 0;
     }
     if (b1[0]) draw_text(dc, g_fSmall, gray, 20, 108, 440, 126, b1, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
@@ -4699,12 +5338,13 @@ static void paint(HDC dc, const RECT *cl)
     draw_text(dc, g_fUI, gray, 402, ny, 440, ny + 25, nextConv ? L".m4a" : L".wav", DT_LEFT | DT_VCENTER);
     }
 
-    /* save folder */
-    draw_text(dc, g_fSmall, gray, 20, 258, 74, 278, L"Salva in:", DT_LEFT | DT_VCENTER);
-    draw_text(dc, g_fUI, fg, 74, 258, 440, 278, rec ? g_wav.folder : g_saveFolder, DT_LEFT | DT_VCENTER | DT_PATH_ELLIPSIS);
+    /* source (button drawn by the control) + save folder */
+    draw_text(dc, g_fSmall, gray, 20, 258, 74, 280, L"Sorgente:", DT_LEFT | DT_VCENTER);
+    draw_text(dc, g_fSmall, gray, 20, 284, 74, 304, L"Salva in:", DT_LEFT | DT_VCENTER);
+    draw_text(dc, g_fUI, fg, 74, 284, 440, 304, rec ? g_wav.folder : g_saveFolder, DT_LEFT | DT_VCENTER | DT_PATH_ELLIPSIS);
 
     /* hints */
-    draw_text(dc, g_fSmall, gray, 20, 318, 440, 338,
+    draw_text(dc, g_fSmall, gray, 20, 344, 440, 364,
               g_tplCustomShown ? L"Segnaposto: {data} {ora} {giorno} {titolo} {n}"
               : g_hotkeyOk ? L"Ctrl+Alt+R avvia/ferma  \u00B7  Ctrl+Alt+P pausa"
                          : L"Ctrl+Alt+R non disponibile",
@@ -4835,6 +5475,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         SendMessageW(g_editName, EM_LIMITTEXT, 200, 0);
         g_btnTpl    = CreateWindowExW(0, L"BUTTON", L"\u25BE", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                       0, 0, 10, 10, h, (HMENU)(INT_PTR)IDC_TPLBTN, g_hinst, NULL);
+        g_btnSrc    = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_LEFT,
+                                      S(74), S(258), S(160), S(22), h, (HMENU)(INT_PTR)IDC_SRCBTN, g_hinst, NULL);
         g_tplCustomShown = !template_is_preset(g_template);
         SendMessageW(g_cbTemplate, CB_LIMITTEXT, 200, 0);
         fill_template_combo();
@@ -4858,6 +5500,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         SetWindowPos(h, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
         set_window_size(h);
         layout();
+        g_srcBtnText[0] = 0;
+        src_button_update();
         InvalidateRect(h, NULL, TRUE);
         return 0;
     }
@@ -4884,6 +5528,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             }
             return 0;
         case IDC_FOLDER: if (!g_recording) pick_folder(); return 0;
+        case IDC_SRCBTN: if (!g_recording && !g_pending && !g_stopping) src_menu(h); return 0;
         case IDC_OPEN:   open_folder(); return 0;
         case IDC_SETTINGS:
             DialogBoxParamW(g_hinst, MAKEINTRESOURCEW(IDD_SETTINGS), h, settings_proc, 0);
@@ -4962,7 +5607,16 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (r > 0) { g_meterDb = (r - 20000) / 100.0; g_meterStale = 0; }
             else if (++g_meterStale > 3) g_meterDb = -120.0;
             if (g_recording) update_title();
+            if (g_recording && g_srcState != g_srcBtnState) src_button_update();
             if (g_recording || g_convPending) InvalidateRect(h, NULL, FALSE);
+            if (InterlockedExchange(&g_srcNotice, 0)) {
+                WCHAR m[900], e[640];
+                _snwprintf(m, 899, L"Non \u00E8 possibile registrare solo l'audio di %ls su questo PC "
+                           L"(serve Windows 10 versione 2004 o successiva).\n\nLa registrazione continua con tutto il sistema.\n\n%ls",
+                           g_curSrcName, hr_str(g_srcLastHr, e, 640));
+                m[899] = 0;
+                MessageBoxW(h, m, APP_TITLE L" - sorgente", MB_ICONWARNING);
+            }
         } else if (wp == TIMER_DISK) {
             refresh_free();
             if (g_recording && !g_stopping && g_freeNow >= 0 && g_freeNow < LOW_DISK_STOP) {
@@ -5146,6 +5800,13 @@ static int run_test(int seconds, const WCHAR *outArg, const WCHAR *nameArg, cons
         log_msg(L"TEST resuming session %ls (%.2f s recorded, %ls)", g_pendBase, baseSec, g_pendCrashed ? L"crashed" : L"suspended");
     }
     g_convEnabled = g_compress && g_mfAvailable && g_convThread;
+    if (g_startSrcExe[0] && !g_startSrcName[0]) {   /* --source-exe: friendly name like the picker */
+        DWORD pid = src_find_root(g_startSrcExe);
+        if (pid) proc_friendly(pid, g_startSrcExe, g_startSrcName, 128);
+        else wcsncpy(g_startSrcName, g_startSrcExe, 127);
+        log_msg(L"TEST source %ls -> \"%ls\" root PID %lu%ls", g_startSrcExe, g_startSrcName, (unsigned long)pid,
+                pid ? L"" : L" (not running)");
+    }
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
     if (!rec_start(folder, 0, resumed, err, 1024)) {
         log_msg(L"RESULT FAIL could not start: %ls", err);
@@ -5218,6 +5879,16 @@ static int run_test(int seconds, const WCHAR *outArg, const WCHAR *nameArg, cons
             peak_db(g_peakMax), g_peakMax / 1000000.0, (double)g_framesPadded / OUT_RATE,
             (double)g_framesDropped / OUT_RATE, (long)g_discont, (long)g_reconnects,
             g_devName, g_fmtDesc, g_curPath);
+    {
+        static const WCHAR *st[4] = { L"system", L"app", L"waiting", L"fallback-system" };
+        WCHAR e[640];
+        log_msg(L"RESULT_SOURCE %ls requested=\"%ls\" name=\"%ls\" state=%ls attached=%ld exits=%ld activation_failures=%ld "
+                L"last_pid=%ld captured=%.2fs synthesized=%.2fs last_error=%ls",
+                (!g_curSrcExe[0] || g_srcState == 1 || g_srcState == 3 || g_srcState == 2) ? L"OK" : L"FAIL",
+                g_curSrcExe, g_curSrcName, st[g_srcState & 3], (long)g_srcAttaches, (long)g_srcExits, (long)g_srcActFails,
+                (long)g_srcPid, (double)(g_framesOut - g_framesPadded) / OUT_RATE, (double)g_framesPadded / OUT_RATE,
+                g_srcLastHr == S_OK ? L"none" : hr_str(g_srcLastHr, e, 640));
+    }
     {   /* the big timer shown in the UI must match what was actually written */
         double uiSec;
         if (g_timerSamples && g_timerLast - file_ms() > g_timerBack) g_timerBack = g_timerLast - file_ms();
@@ -5326,6 +5997,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
     int optSil = -1, optSilDb = 1, optSilMin = 0, optSilPad = -1;
     TestOpts topt;
     HANDLE mutex = NULL;
+    int optListSrc = 0;
     LARGE_INTEGER f;
     (void)hPrev; (void)cmdLine;
 
@@ -5388,11 +6060,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
         else if (!wcscmp(argv[i], L"--silence-db") && i + 1 < argc) optSilDb = _wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--silence-min") && i + 1 < argc) optSilMin = _wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--silence-pad") && i + 1 < argc) optSilPad = _wtoi(argv[++i]);
+        else if (!wcscmp(argv[i], L"--source-exe") && i + 1 < argc) { wcsncpy(g_startSrcExe, argv[++i], 63); g_startSrcExe[63] = 0; }
+        else if (!wcscmp(argv[i], L"--list-sources")) optListSrc = 1;
+        else if (!wcscmp(argv[i], L"--force-proc-fail")) g_forceProcFail = 1;
+        else if (!wcscmp(argv[i], L"--open-source-menu")) g_openSrcMenu = 1;
         else if (!wcscmp(argv[i], L"--fake-aac") && i + 1 < argc) { wcsncpy(g_fakeAacPath, argv[++i], MAX_PATH - 1); g_fakeAacPath[MAX_PATH - 1] = 0; }
     }
 
     if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) return 11;
+    g_testMode = testSec >= 0 || optListSrc;
     settings_init();
+    if (optListSrc) {            /* headless: what the source picker would list */
+        WCHAR folder[MAX_PATH], err[512];
+        int k;
+        if (!make_folder(outArg ? outArg : L".", folder, err, 512)) { CoUninitialize(); return 3; }
+        _snwprintf(g_logPath, MAX_PATH * 2 - 1, L"%ls\\sources.log", folder); g_logPath[MAX_PATH * 2 - 1] = 0;
+        src_enum();
+        log_msg(L"SOURCES %d app(s)", g_srcAppN);
+        for (k = 0; k < g_srcAppN; k++)
+            log_msg(L"SOURCE exe=%ls name=\"%ls\" root_pid=%lu audio_session=%d playing=%d", g_srcApps[k].exe, g_srcApps[k].name,
+                    (unsigned long)g_srcApps[k].pid, g_srcApps[k].session, g_srcApps[k].active);
+        if (argv) LocalFree(argv);
+        CoUninitialize();
+        return 0;
+    }
     settings_load();
     if (testSec >= 0) {          /* test-mode overrides (not saved) */
         if (optKbps >= 32 && optKbps <= 320) g_aacKbps = optKbps;
@@ -5475,6 +6166,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
         g_convNotify = h;
         ShowWindow(h, nShow);
         UpdateWindow(h);
+        if (g_openSrcMenu) PostMessageW(h, WM_COMMAND, IDC_SRCBTN, 0);   /* screenshot helper */
         if (g_recoverMsg[0]) {
             tray_set_ex(1, APP_TITLE, L"Recuperata registrazione interrotta", base_name(g_recoverMsg), NIIF_INFO);
             SetTimer(h, TIMER_TRAY, 15000, NULL);

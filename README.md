@@ -2,6 +2,8 @@
 
 Records everything Windows plays on the **default output device** (for example browser tab audio from Edge or Chrome during long video calls) to a WAV file. It uses WASAPI loopback capture: plain Win32 and COM, no third-party libraries.
 
+Since v1.4.0 the GUI can also record **just one app** (for example only the browser, or only Teams) instead of the whole system: see [v1.4.0](#v140--choose-the-audio-source-whole-system-or-one-app).
+
 There are two front-ends built on the same capture engine:
 
 | File | What it is |
@@ -162,7 +164,9 @@ For speech only, `-b:a 32k -application voip` is plenty. To join parts first: `f
 
 ## Known limitations
 - Records **system output only**. Your **microphone is not captured**, so in a call you get the other people, not yourself (unless an app plays your mic back).
-- Records only the **default** output device. Audio an app sends to a different, non-default device is not recorded.
+- Records only the **default** output device. Audio an app sends to a different, non-default device is not recorded. ("Tutto il sistema" mode; one-app mode captures that app on whatever device it plays to.)
+- One-app mode records a whole application (all its processes), never a **single browser tab**: Windows has no API that separates tabs, because all tabs play through the same browser audio process. Use a separate browser (or profile/window of another browser) for the call if you need isolation.
+- One-app mode needs Windows 10 version 2004 (build 19041) or later; on older systems it falls back to the whole system with a warning.
 - DRM-protected audio (some streaming services) may come through as silence.
 - If an app takes the device in **exclusive mode**, loopback stops. The recorder writes silence and reconnects when the device is released.
 - Linear resampling is only used when the device mix rate isn't 48 kHz. It's fine for speech but not audiophile quality. Channels beyond 7.1 are ignored (only the first 8 are mixed).
@@ -255,3 +259,18 @@ For speech only, `-b:a 32k -application voip` is plenty. To join parts first: `f
 - Anti-strobe: when a below-threshold run ends, the gray band holds its last value for 150 ms; a new run within that time restarts the counter from 0.0 (it follows the detector). "Ultimo silenzio" (6 s) is shown for runs ≥ 0.3 s.
 - Window title unchanged (still adds "· silenzio m:ss" after 1 s). Timer/file-length/cut logic unchanged.
 - Screenshot: screenshots/silence_tenths.png (gray 4.7 s, blue cut 2.4 s, Ultimo silenzio 1.9 s)
+
+## v1.4.0 — choose the audio source: whole system or one app
+
+- New **"Sorgente: … ▾"** row under the big buttons. Choices: **Tutto il sistema** (default, unchanged behaviour: loopback of the default output device) or **one app**.
+- The menu lists the apps that currently have an audio session (by friendly name, e.g. "Google Chrome", "Microsoft Edge", "Microsoft Teams"; "♪ in riproduzione" marks the ones playing now), then **"Altre app aperte"** (other apps with a window, in case an app has not opened its audio yet), **"Aggiorna elenco"**, and a reminder that a single browser tab cannot be separated. One entry per app: browsers' many processes are grouped under their root process.
+- Capture uses Windows **process loopback** (`ActivateAudioInterfaceAsync` on `VAD\Process_Loopback`, `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`), so the app's child processes (e.g. the browser's audio service process) are included and nothing else is: other apps, system sounds and the microphone are not recorded. Format: 48 kHz stereo 16-bit with `AUTOCONVERTPCM`; silence is synthesized when the app is quiet, so the file stays aligned with real time.
+- The choice is saved in `settings.ini` (`SourceExe`, `SourceName`) by exe name and resolved to the current root process at every start. It can only be changed while not recording. It is also stored in the session (`session.ini`), so **"Riprendi sessione"** continues with the same app (sessions from ≤ 1.3.x resume as whole system).
+- **App not running at start:** a prompt offers *Sì* = record the whole system this time, *No* = start anyway and wait for the app (silence until it starts), *Annulla*.
+- **App closed while recording:** recording continues with silence, an orange line says **"App chiusa: in attesa di X… (registra silenzio)"**, and the app is re-attached automatically when it starts again (checked every 2 s).
+- **Process loopback unavailable** (older Windows): a warning is shown and the recording continues with the whole system. After the app was attached once, the recorder never silently switches to the whole system (privacy): it keeps waiting for the app.
+- The window title / taskbar / tray tooltip show the source ("● REC 00:12:34 · Microsoft Edge - Loopback Rec"); the idle hint and info line too.
+- Everything else is unchanged: live m4a, silence cut with live settings, pause, crash-safe resume, live rename, taskbar overlay, meter, timer = file length.
+- Test flags: `--source-exe NAME` (e.g. `msedge.exe`), `--list-sources --out <folder>` (writes `sources.log` with what the picker would offer), `--force-proc-fail` (simulate missing process loopback), `--open-source-menu` (GUI: open the picker at start, for screenshots). Test mode logs `RESULT_SOURCE … state=app|waiting|fallback-system attached= exits= captured= synthesized=`. Test mode no longer rotates the GUI's `log.txt` or creates `settings.ini`.
+- Tested: Wine regression of all system-mode flags (identical results to 1.3.11), waiting path, fallback path; Windows 11 25H2: 5 s whole system and 5 s Edge-only capture (timer = file length), and an app exit/re-attach test.
+- Screenshot: screenshots/source_picker.png
